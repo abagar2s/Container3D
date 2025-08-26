@@ -1,10 +1,13 @@
 // src/App.js
 // ---------------------------------------------
-// Mini Yard Crane: multiple containers + occupancy + 2 tiers
+// Mini Yard Crane: multi containers + occupancy + 2 tiers + Entstapeln
 // 40' spans same letter + next row (A1+A2, B2+B3, etc.)
 // Tier rules:
-//  - 20' on Tier 2: needs support below at that cell.
-//  - 40' on Tier 2: needs support below on BOTH cells (one 40' or two 20').
+//  - Prefer Tier 1. If Tier 1 occupied, try Tier 2 with support:
+//    * 20’ on Tier 2: needs support directly underneath.
+//    * 40’ on Tier 2: both cells below must be occupied (one 40’ or two 20’).
+// Entstapeln: can only remove if no container sits above any of its cells.
+// Pure React + three.js
 // ---------------------------------------------
 
 import React, { useEffect, useRef, useState } from "react";
@@ -25,7 +28,7 @@ const CONTAINER_HALF_H = CONTAINER_H / 2;
 const PLATE_THICKNESS = 0.05;
 const TRAVEL_Y = 5.5;       // crane travel height
 const CRANE_Z = -1.2;       // crane bridge Z in front of yard
-const MAX_TIERS = 2;        // we support 2 tiers for now
+const MAX_TIERS = 2;        // support 2 tiers
 
 // Gate spawn baseline (left of A1)
 const GATE_START = new THREE.Vector3(-6, CONTAINER_HALF_H, 0);
@@ -84,6 +87,9 @@ export default function App() {
   // Add form
   const [newSize, setNewSize] = useState(1); // 1 TEU (20') or 2 TEU (40')
   const [newColor, setNewColor] = useState("#d7bde2");
+
+  // gate index for spacing parked/added containers at the gate
+  const gateIndexRef = useRef(0);
 
   useEffect(() => {
     const el = mountRef.current;
@@ -182,8 +188,8 @@ export default function App() {
 
     three.current = { scene, camera, renderer, controls, anims: [] };
 
-    // Spawn one initial 20' container
-    const first = addContainerToScene(scene, { sizeTEU: 1, color: "#d7bde2" }, 0);
+    // Spawn one initial 20' container at gate
+    const first = addContainerToScene(scene, { sizeTEU: 1, color: "#d7bde2" }, gateIndexRef.current++);
     containersRef.current = [first];
     setContainers([dehydrate(first)]);
     setSelectedId(first.id);
@@ -198,7 +204,7 @@ export default function App() {
   // ===== Scene helpers =====
   function buildContainerMesh(sizeTEU = 1, color = "#d7bde2") {
     // 40' spans along Z (rows), not X.
-    const widthX = BAY_W * 0.95; // constant width fits one bay
+    const widthX = BAY_W * 0.95; // fits one bay
     const depthZ = (sizeTEU === 2 ? ROW_D * 2 : ROW_D) * 0.95; // 40' doubles depth
     const geom = new THREE.BoxGeometry(widthX, CONTAINER_H, depthZ);
     const mat = new THREE.MeshStandardMaterial({
@@ -275,11 +281,14 @@ export default function App() {
   }
 
   // ---- Container management (scene + state) ----
+  function gatePositionForIndex(idx) {
+    const offsetX = -idx * (BAY_W * GATE_SPACING + 0.2);
+    return GATE_START.clone().add(new THREE.Vector3(offsetX, 0, 0));
+  }
+
   function addContainerToScene(scene, { sizeTEU, color }, indexForQueue) {
     const mesh = buildContainerMesh(sizeTEU, color);
-    // Gate queue spacing
-    const offsetX = -indexForQueue * (BAY_W * GATE_SPACING + 0.2);
-    mesh.position.copy(GATE_START.clone().add(new THREE.Vector3(offsetX, 0, 0)));
+    mesh.position.copy(gatePositionForIndex(indexForQueue));
     scene.add(mesh);
 
     const id = `C${Math.random().toString(36).slice(2, 8)}`;
@@ -294,15 +303,14 @@ export default function App() {
   function handleAddContainer() {
     if (!three.current.scene) return;
     const scene = three.current.scene;
-    const idx = containersRef.current.length;
-    const added = addContainerToScene(scene, { sizeTEU: Number(newSize), color: newColor }, idx);
+    const added = addContainerToScene(scene, { sizeTEU: Number(newSize), color: newColor }, gateIndexRef.current++);
     containersRef.current = [...containersRef.current, added];
     setContainers((prev) => [...prev, dehydrate(added)]);
     setSelectedId(added.id);
   }
 
   // ===== Occupancy helpers (with tiers) =====
-  const key = (bay, row, tier) => `${bay}-${row}-${tier}`;
+  const k = (bay, row, tier) => `${bay}-${row}-${tier}`;
 
   function cellsForSizeAt(sizeTEU, bay, row, tier) {
     if (sizeTEU === 1) return [{ bay, row, tier }];
@@ -312,8 +320,7 @@ export default function App() {
 
   function isFreeFor(containerId, cells) {
     for (const c of cells) {
-      const k = key(c.bay, c.row, c.tier);
-      const occBy = occRef.current[k];
+      const occBy = occRef.current[k(c.bay, c.row, c.tier)];
       if (occBy && occBy !== containerId) return false;
     }
     return true;
@@ -321,29 +328,21 @@ export default function App() {
 
   // Support check for Tier 2
   function hasSupportBelow(sizeTEU, bay, row) {
-    // We check Tier 1 occupancy under the would-be Tier 2 cells
     if (sizeTEU === 1) {
-      const kBelow = key(bay, row, 1);
-      return !!occRef.current[kBelow];
+      return !!occRef.current[k(bay, row, 1)];
     }
-    // 40': need BOTH cells supported at Tier 1
     if (row >= ROWS) return false;
-    const k1 = key(bay, row, 1);
-    const k2 = key(bay, row + 1, 1);
-    const id1 = occRef.current[k1];
-    const id2 = occRef.current[k2];
-    // requirement: both present; they may be the same (one 40') or different (two 20')
-    return !!(id1 && id2);
+    const id1 = occRef.current[k(bay, row, 1)];
+    const id2 = occRef.current[k(bay, row + 1, 1)];
+    return !!(id1 && id2); // they may be same (one 40’) or different (two 20’)
   }
 
   // Decide tier automatically: prefer Tier 1, else Tier 2 with support
   function chooseTier(containerId, sizeTEU, bay, row) {
-    // Try Tier 1
     const cellsTier1 = cellsForSizeAt(sizeTEU, bay, row, 1);
     if (cellsTier1 && isFreeFor(containerId, cellsTier1)) {
       return { ok: true, tier: 1, cells: cellsTier1 };
     }
-    // Try Tier 2
     const cellsTier2 = cellsForSizeAt(sizeTEU, bay, row, 2);
     if (!cellsTier2) return { ok: false, reason: "Kein Platz (Rand) für 40’." };
     if (!isFreeFor(containerId, cellsTier2))
@@ -361,18 +360,28 @@ export default function App() {
   }
 
   function occupy(containerId, newCells, prevCells = []) {
-    // clear previous cells
     const occCopy = { ...occRef.current };
     for (const c of prevCells) {
-      const k = key(c.bay, c.row, c.tier);
-      if (occCopy[k] === containerId) delete occCopy[k];
+      const kk = k(c.bay, c.row, c.tier);
+      if (occCopy[kk] === containerId) delete occCopy[kk];
     }
-    // set new cells
     for (const c of newCells) {
-      occCopy[key(c.bay, c.row, c.tier)] = containerId;
+      occCopy[k(c.bay, c.row, c.tier)] = containerId;
     }
     occRef.current = occCopy;
     setOcc(occCopy);
+  }
+
+  // ===== Entstapeln helpers =====
+  function canRemove(entry) {
+    // A container can be removed if no cell above any of its cells is occupied by another container.
+    const blockers = new Set();
+    for (const c of entry.cells || []) {
+      if (c.tier >= MAX_TIERS) continue; // nothing above
+      const aboveId = occRef.current[k(c.bay, c.row, c.tier + 1)];
+      if (aboveId && aboveId !== entry.id) blockers.add(aboveId);
+    }
+    return { ok: blockers.size === 0, blockers: Array.from(blockers) };
   }
 
   // ===== Actions =====
@@ -416,8 +425,6 @@ export default function App() {
     topOver.y = topY;
 
     // Container center at chosen tier:
-    // 20’: center of (bay,row,tier)
-    // 40’: midpoint between (bay,row,tier) and (bay,row+1,tier)
     let dropCenter = slotCenterAtTier(target.bay, target.row, tier).clone();
     if (entry.sizeTEU === 2) {
       const nextCenter = slotCenterAtTier(target.bay, target.row + 1, tier).clone();
@@ -437,15 +444,94 @@ export default function App() {
     // Hook + container choreography
     animateTo(hook, pickTop, 600, () => {
       animateTo(cont, pickTop, 600, () => {
-        // Move along Z to above target path
         const topOverZ = entry.sizeTEU === 1 ? topOver.z : dropCenter.z;
         animateTo(hook, new THREE.Vector3(topOver.x, topOver.y, CRANE_Z), 400);
         animateTo(cont, new THREE.Vector3(topOver.x, topOver.y, topOverZ), 900, () => {
           animateTo(hook, hookRest, 600);
           animateTo(cont, dropCenter, 600, () => {
-            // Update occupancy & remember our cells (with tiers)
             occupy(entry.id, cells, entry.cells);
             entry.cells = cells;
+            setBusy(false);
+          });
+        });
+      });
+    });
+  }
+
+  function removeSelected() {
+    if (busy) return;
+    if (!selectedId) {
+      alert("Bitte zuerst einen Container auswählen.");
+      return;
+    }
+    const entry = containersRef.current.find((c) => c.id === selectedId);
+    if (!entry) {
+      alert("Ausgewählter Container nicht gefunden.");
+      return;
+    }
+    if (!entry.cells || entry.cells.length === 0) {
+      alert("Dieser Container steht bereits am Gate (nicht im Yard).");
+      return;
+    }
+
+    const { ok, blockers } = canRemove(entry);
+    if (!ok) {
+      // Map blocker IDs to names for friendlier message
+      const names = blockers
+        .map((bid) => containersRef.current.find((x) => x.id === bid)?.name || bid)
+        .join(", ");
+      alert("Entstapeln nicht möglich. Zuerst entfernen: " + names);
+      return;
+    }
+
+    setBusy(true);
+
+    const cont = entry.mesh;
+    const { bridge, hook } = craneRef.current;
+    const topY = TRAVEL_Y;
+
+    // pick from current center
+    // If 40’, we lift from its current center (already between two rows)
+    let currentCenter = null;
+    if (entry.cells.length === 1) {
+      const c = entry.cells[0];
+      currentCenter = slotCenterAtTier(c.bay, c.row, c.tier);
+    } else {
+      // 40' has two cells with same bay, consecutive rows, same tier
+      const c1 = entry.cells[0];
+      const c2 = entry.cells[1];
+      currentCenter = slotCenterAtTier(c1.bay, c1.row, c1.tier).lerp(
+        slotCenterAtTier(c2.bay, c2.row, c2.tier),
+        0.5
+      );
+    }
+    const liftTop = currentCenter.clone();
+    liftTop.y = topY;
+
+    // target gate parking position (new index)
+    const parkIndex = gateIndexRef.current++;
+    const parkPos = gatePositionForIndex(parkIndex).clone(); // y already = CONTAINER_HALF_H
+
+    const hookRest = liftTop.clone();
+    hookRest.z = CRANE_Z;
+
+    // Bridge to X over current bay
+    animateTo(bridge, new THREE.Vector3(liftTop.x, topY, CRANE_Z), 600);
+
+    // Lift and move to gate
+    animateTo(hook, liftTop, 500, () => {
+      animateTo(cont, liftTop, 500, () => {
+        // move horizontally to the left (gate line at z ~ 0)
+        const flyTop = new THREE.Vector3(parkPos.x, topY, parkPos.z);
+        animateTo(hook, new THREE.Vector3(liftTop.x, topY, CRANE_Z), 300);
+        animateTo(cont, flyTop, 900, () => {
+          // lower down to gate ground
+          const finalPos = parkPos.clone();
+          animateTo(hook, new THREE.Vector3(flyTop.x, flyTop.y, CRANE_Z), 300);
+          animateTo(cont, finalPos, 600, () => {
+            // Free occupancy
+            occupy(entry.id, [], entry.cells);
+            entry.cells = [];
             setBusy(false);
           });
         });
@@ -458,7 +544,7 @@ export default function App() {
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: "1fr 380px",
+        gridTemplateColumns: "1fr 420px",
         gap: 16,
         height: "100vh",
         padding: 16,
@@ -539,7 +625,7 @@ export default function App() {
           <select
             value={selectedId || ""}
             onChange={(e) => setSelectedId(e.target.value)}
-            style={{ marginLeft: 8, padding: "6px 8px", minWidth: 240 }}
+            style={{ marginLeft: 8, padding: "6px 8px", minWidth: 260 }}
           >
             {containers.map((c) => (
               <option key={c.id} value={c.id}>
@@ -560,25 +646,44 @@ export default function App() {
           />
         </label>
 
-        <button
-          onClick={placeAtSlot}
-          disabled={busy || !selectedId}
-          style={{
-            padding: "8px 12px",
-            border: "1px solid #ddd",
-            borderRadius: 8,
-            background: busy ? "#eee" : "#f7f7f7",
-            cursor: busy ? "not-allowed" : "pointer",
-          }}
-        >
-          {busy ? "Kran arbeitet…" : "Aktiven Container zum Slot bewegen"}
-        </button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            onClick={placeAtSlot}
+            disabled={busy || !selectedId}
+            style={{
+              flex: 1,
+              padding: "8px 12px",
+              border: "1px solid #ddd",
+              borderRadius: 8,
+              background: busy ? "#eee" : "#f7f7f7",
+              cursor: busy ? "not-allowed" : "pointer",
+            }}
+          >
+            {busy ? "Kran arbeitet…" : "Zum Slot bewegen"}
+          </button>
+
+          <button
+            onClick={removeSelected}
+            disabled={busy || !selectedId}
+            style={{
+              flex: 1,
+              padding: "8px 12px",
+              border: "1px solid #ddd",
+              borderRadius: 8,
+              background: busy ? "#eee" : "#fff4f4",
+              cursor: busy ? "not-allowed" : "pointer",
+            }}
+            title="Entstapeln: Container zurück zum Gate bringen"
+          >
+            {busy ? "…" : "Entstapeln (entfernen)"}
+          </button>
+        </div>
 
         <div style={{ fontSize: 13, color: "#555", lineHeight: 1.5 }}>
           • **Tier 1** zuerst, **Tier 2** nur wenn Tier 1 belegt ist und Stützregeln passen.<br />
           • 20’ auf Tier 2: Zelle darunter muss belegt sein.<br />
           • 40’ auf Tier 2: Beide Zellen darunter müssen belegt sein (ein 40’ oder zwei 20’).<br />
-          • Letzte Reihe (x3) ist Startzelle für 40’ nicht zulässig (braucht +1 Reihe).<br />
+          • Entstapeln: Nur möglich, wenn **nichts** darüber steht.<br />
           • Kamera: Linke Maus – Orbit, Mausrad – Zoom, Rechte Maus – Pan.
         </div>
       </div>
