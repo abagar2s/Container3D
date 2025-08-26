@@ -1,33 +1,37 @@
 // src/App.js
 // ---------------------------------------------
-// Minimaler Hafenkran: Container in 3×3-Yard setzen
-// Bays: A..C (x-Richtung), Reihen: 1..3 (z-Richtung)
-// UI: Slot-Eingabe wie "A1" und Button zum Ausführen
-// Keine Tailwind-Abhängigkeit – reines React + three.js
+// Mini Yard Crane: multiple containers + occupancy + 2 tiers
+// 40' spans same letter + next row (A1+A2, B2+B3, etc.)
+// Tier rules:
+//  - 20' on Tier 2: needs support below at that cell.
+//  - 40' on Tier 2: needs support below on BOTH cells (one 40' or two 20').
 // ---------------------------------------------
 
 import React, { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
-// ===== Konstante Maße (alles sauber aufeinander abgestimmt) =====
-const BAYS = 3;                 // A..C
-const ROWS = 3;                 // 1..3
+// ===== Constants =====
+const BAYS = 3;
+const ROWS = 3;
 const LETTERS = ["A", "B", "C"];
 
-const BAY_W = 2.5;              // Abstand pro Bay (X)
-const ROW_D = 2.6;              // Abstand pro Reihe (Z)
-const TIER_H = 2.3;             // "Etagenhöhe" – Schritt für Stapeln
-const CONTAINER_H = TIER_H * 0.9;        // Box ist minimal kleiner als Etagenhöhe
+const BAY_W = 2.5;          // X spacing per bay (letter)
+const ROW_D = 2.6;          // Z spacing per row (number)
+const TIER_H = 2.3;         // tier step height
+const CONTAINER_H = TIER_H * 0.9;
 const CONTAINER_HALF_H = CONTAINER_H / 2;
 
-const PLATE_THICKNESS = 0.05;   // Bodengrundplatte (optisch)
-const TRAVEL_Y = 5.5;           // Kranfahrt-Höhe (über Yard)
-const CRANE_Z = -1.2;           // Kran-Brücke steht vor dem Yard (Z < 0)
+const PLATE_THICKNESS = 0.05;
+const TRAVEL_Y = 5.5;       // crane travel height
+const CRANE_Z = -1.2;       // crane bridge Z in front of yard
+const MAX_TIERS = 2;        // we support 2 tiers for now
 
-// ===== Hilfsfunktionen =====
+// Gate spawn baseline (left of A1)
+const GATE_START = new THREE.Vector3(-6, CONTAINER_HALF_H, 0);
+const GATE_SPACING = 1.1;
 
-// "A1" -> { bay: 1..3, row: 1..3 } oder null bei ungültig
+// ===== Helpers =====
 function parseSlot(slot) {
   if (!slot || slot.length < 2) return null;
   const bayLetter = slot[0].toUpperCase();
@@ -40,45 +44,51 @@ function parseSlot(slot) {
   return { bay, row };
 }
 
-// Weltkoordinate der ZELLENMITTE für eine (bay,row) + TIER
-// WICHTIG: Y ist ein Zentrum! Für "auf dem Boden stehen" addieren wir
-//          PLATE_THICKNESS + CONTAINER_HALF_H (siehe slotCenterAtTier unten).
 function cellOrigin(bay, row) {
   const x = (bay - 1) * BAY_W;
   const z = (row - 1) * ROW_D;
   return new THREE.Vector3(x, 0, z);
 }
 
-// Zentrum einer Box, wenn sie auf TIER (1=unten) steht
 function slotCenterAtTier(bay, row, tier = 1) {
   const p = cellOrigin(bay, row);
-  // Bodenoberseite ist bei y = PLATE_THICKNESS
-  // Box-Zentrum = Boden + halbe Boxhöhe + (tier-1)*TIER_H
   p.y = PLATE_THICKNESS + CONTAINER_HALF_H + (tier - 1) * TIER_H;
   return p;
 }
 
-// simple Easing
 function easeInOut(t) {
   return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
 }
 
-// ===== Hauptkomponente =====
+// ===== Main Component =====
 export default function App() {
   const mountRef = useRef(null);
 
-  // Referenzen auf 3D-Objekte / Utilities
+  // three.js handles
   const three = useRef({ scene: null, camera: null, renderer: null, controls: null, anims: [] });
   const craneRef = useRef({ bridge: null, hook: null });
-  const containerRef = useRef(null);
 
-  const [slot, setSlot] = useState("A1");  // Zielslot
-  const [busy, setBusy] = useState(false); // Blockiert Animationen
+  // containers: [{id, name, mesh, sizeTEU, color, cells: [{bay,row,tier}, ...] }]
+  const [containers, setContainers] = useState([]);
+  const containersRef = useRef([]);
+
+  // occupancy map: key "bay-row-tier" -> containerId
+  const [occ, setOcc] = useState({});
+  const occRef = useRef({});
+
+  const [selectedId, setSelectedId] = useState(null);
+
+  const [slot, setSlot] = useState("A1");
+  const [busy, setBusy] = useState(false);
+
+  // Add form
+  const [newSize, setNewSize] = useState(1); // 1 TEU (20') or 2 TEU (40')
+  const [newColor, setNewColor] = useState("#d7bde2");
 
   useEffect(() => {
     const el = mountRef.current;
 
-    // --- Szene, Kamera, Renderer
+    // --- Scene / Camera / Renderer
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0xf6f8fa);
 
@@ -89,19 +99,18 @@ export default function App() {
     renderer.setSize(el.clientWidth, el.clientHeight);
     el.appendChild(renderer.domElement);
 
-    // Maussteuerung
+    // controls
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
 
-    // --- Licht
+    // lights
     scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 0.9));
     const dir = new THREE.DirectionalLight(0xffffff, 0.8);
     dir.position.set(20, 30, 10);
     scene.add(dir);
 
-    // --- Grid + Bodenplatte
+    // grid + ground plate
     const grid = new THREE.GridHelper(30, 30, 0x888888, 0xdddddd);
-    // leicht verschoben, damit Yard auf dem Grid "sitzt"
     const baseCell = cellOrigin(1, 1);
     grid.position.set(baseCell.x + BAY_W, 0, baseCell.z + ROW_D);
     scene.add(grid);
@@ -109,12 +118,10 @@ export default function App() {
     const totalW = BAYS * BAY_W;
     const totalD = ROWS * ROW_D;
 
-    // Bodenplatte (dünner Klotz, damit wir eine klare "Oberkante" haben)
     const plate = new THREE.Mesh(
       new THREE.BoxGeometry(totalW, PLATE_THICKNESS, totalD),
       new THREE.MeshBasicMaterial({ color: 0xeeeeee, transparent: true, opacity: 0.85 })
     );
-    // Mittelpunkt der Platte = halbe Dicke; wir zentrieren die Platte unter dem Yard
     plate.position.set(
       baseCell.x + totalW / 2 - BAY_W / 2,
       PLATE_THICKNESS / 2,
@@ -122,10 +129,8 @@ export default function App() {
     );
     scene.add(plate);
 
-    // --- Zell-Linien (optische Rasterung)
+    // cell lines & labels
     drawCellLines(scene);
-
-    // --- Beschriftungen (Bays A..C, Reihen 1..3)
     for (let b = 1; b <= BAYS; b++) {
       const s = makeLabelSprite(LETTERS[b - 1]);
       const p = cellOrigin(b, 1);
@@ -139,7 +144,7 @@ export default function App() {
       scene.add(s);
     }
 
-    // --- Kran (Brücke + "Haken")
+    // crane (bridge + hook)
     const bridge = new THREE.Mesh(
       new THREE.BoxGeometry(totalW + 1.2, 0.15, 0.2),
       new THREE.MeshStandardMaterial({ color: 0x4682b4, metalness: 0.2, roughness: 0.5 })
@@ -157,13 +162,7 @@ export default function App() {
 
     craneRef.current = { bridge, hook };
 
-    // --- Ein Container wartet am "Gate" links von A1
-    const cont = buildContainerMesh(1); // 20'-Box
-    cont.position.set(-6, CONTAINER_HALF_H, 0); // exakt auf "Bodenhöhe" zentriert
-    scene.add(cont);
-    containerRef.current = cont;
-
-    // --- Render-Loop
+    // render loop
     const onResize = () => {
       renderer.setSize(el.clientWidth, el.clientHeight);
       camera.aspect = el.clientWidth / el.clientHeight;
@@ -183,7 +182,12 @@ export default function App() {
 
     three.current = { scene, camera, renderer, controls, anims: [] };
 
-    // Aufräumen
+    // Spawn one initial 20' container
+    const first = addContainerToScene(scene, { sizeTEU: 1, color: "#d7bde2" }, 0);
+    containersRef.current = [first];
+    setContainers([dehydrate(first)]);
+    setSelectedId(first.id);
+
     return () => {
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", onResize);
@@ -191,68 +195,24 @@ export default function App() {
     };
   }, []);
 
-  // ===== UI-Handler: Container zum Slot bewegen =====
-  function placeAtSlot() {
-    if (busy) return;
-    const target = parseSlot(slot);
-    if (!target) {
-      alert("Bitte Slot im Format A1..C3 eingeben (z. B. A1)");
-      return;
-    }
-
-    setBusy(true);
-
-    const cont = containerRef.current;
-    const { bridge, hook } = craneRef.current;
-
-    // 1) Anhebepunkt über der Startposition (Gate)
-    const pickTop = cont.position.clone();
-    pickTop.y = TRAVEL_Y;
-
-    // 2) Fahr-Position direkt ÜBER dem Zielslot
-    const dropTop = slotCenterAtTier(target.bay, target.row, 1).clone();
-    dropTop.y = TRAVEL_Y;
-
-    // 3) Exakte Ablageposition (ZENTRUM der Box auf Bodenniveau)
-    const dropDown = slotCenterAtTier(target.bay, target.row, 1).clone();
-
-    // 4) Haken-Ruhelage knapp über der Box nach dem Absetzen
-    const hookRest = dropDown.clone();
-    hookRest.y = dropDown.y + CONTAINER_HALF_H + 0.2;
-    hookRest.z = CRANE_Z; // Haken bleibt auf Kran-Z
-
-    // --- Animationssequenz ---
-    // Brücke fährt X-seitig in Position über dem Ziel
-    animateTo(bridge, new THREE.Vector3(dropTop.x, TRAVEL_Y, CRANE_Z), 800);
-
-    // Haken anheben -> Container anheben -> zum Ziel fahren -> absenken
-    animateTo(hook, pickTop, 600, () => {
-      animateTo(cont, pickTop, 600, () => {
-        animateTo(hook, dropTop.clone().setZ(CRANE_Z), 900);
-        animateTo(cont, dropTop, 900, () => {
-          animateTo(hook, hookRest, 600);
-          animateTo(cont, dropDown, 600, () => {
-            setBusy(false);
-          });
-        });
-      });
-    });
-  }
-
-  // ===== three.js: Mesh & Zeichen-Helfer =====
-  function buildContainerMesh(sizeTEU = 1) {
-    const length = sizeTEU === 2 ? BAY_W * 2 : BAY_W;
-    const geom = new THREE.BoxGeometry(length * 0.95, CONTAINER_H, BAY_W * 0.95);
+  // ===== Scene helpers =====
+  function buildContainerMesh(sizeTEU = 1, color = "#d7bde2") {
+    // 40' spans along Z (rows), not X.
+    const widthX = BAY_W * 0.95; // constant width fits one bay
+    const depthZ = (sizeTEU === 2 ? ROW_D * 2 : ROW_D) * 0.95; // 40' doubles depth
+    const geom = new THREE.BoxGeometry(widthX, CONTAINER_H, depthZ);
     const mat = new THREE.MeshStandardMaterial({
-      color: 0xd7bde2,
+      color: new THREE.Color(color),
       roughness: 0.6,
       metalness: 0.1,
     });
-    return new THREE.Mesh(geom, mat);
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.userData.sizeTEU = sizeTEU;
+    mesh.userData.color = color;
+    return mesh;
   }
 
   function makeLabelSprite(text) {
-    // Beschriftung per Canvas -> als Sprite in die Szene
     const canvas = document.createElement("canvas");
     canvas.width = 256;
     canvas.height = 128;
@@ -271,12 +231,10 @@ export default function App() {
   }
 
   function drawCellLines(scene) {
-    // Dünne Linien für die 3×3 Zellen
     const mat = new THREE.LineBasicMaterial({ color: 0xaaaaaa });
     const group = new THREE.Group();
     const origin = cellOrigin(1, 1);
 
-    // Vertikale Linien (entlang Z), 4 Stück (0..3)
     for (let b = 0; b <= BAYS; b++) {
       const x = origin.x + b * BAY_W - BAY_W / 2;
       const geo = new THREE.BufferGeometry().setFromPoints([
@@ -286,7 +244,6 @@ export default function App() {
       group.add(new THREE.Line(geo, mat));
     }
 
-    // Horizontale Linien (entlang X), 4 Stück (0..3)
     for (let r = 0; r <= ROWS; r++) {
       const z = origin.z + r * ROW_D - ROW_D / 2;
       const geo = new THREE.BufferGeometry().setFromPoints([
@@ -298,7 +255,7 @@ export default function App() {
     scene.add(group);
   }
 
-  // Generischer Tweener für Positionen
+  // Basic tween for positions
   function animateTo(obj, target, ms = 1000, onDone) {
     const start = obj.position.clone();
     const t0 = performance.now();
@@ -317,19 +274,198 @@ export default function App() {
     three.current.anims.push(runner);
   }
 
+  // ---- Container management (scene + state) ----
+  function addContainerToScene(scene, { sizeTEU, color }, indexForQueue) {
+    const mesh = buildContainerMesh(sizeTEU, color);
+    // Gate queue spacing
+    const offsetX = -indexForQueue * (BAY_W * GATE_SPACING + 0.2);
+    mesh.position.copy(GATE_START.clone().add(new THREE.Vector3(offsetX, 0, 0)));
+    scene.add(mesh);
+
+    const id = `C${Math.random().toString(36).slice(2, 8)}`;
+    const name = `${sizeTEU === 2 ? "40’" : "20’"} • ${id.toUpperCase()}`;
+    return { id, name, sizeTEU, color, mesh, cells: [] };
+  }
+
+  function dehydrate(item) {
+    return { id: item.id, name: item.name, sizeTEU: item.sizeTEU, color: item.color };
+  }
+
+  function handleAddContainer() {
+    if (!three.current.scene) return;
+    const scene = three.current.scene;
+    const idx = containersRef.current.length;
+    const added = addContainerToScene(scene, { sizeTEU: Number(newSize), color: newColor }, idx);
+    containersRef.current = [...containersRef.current, added];
+    setContainers((prev) => [...prev, dehydrate(added)]);
+    setSelectedId(added.id);
+  }
+
+  // ===== Occupancy helpers (with tiers) =====
+  const key = (bay, row, tier) => `${bay}-${row}-${tier}`;
+
+  function cellsForSizeAt(sizeTEU, bay, row, tier) {
+    if (sizeTEU === 1) return [{ bay, row, tier }];
+    if (row >= ROWS) return null; // 40' needs row+1
+    return [{ bay, row, tier }, { bay, row: row + 1, tier }];
+  }
+
+  function isFreeFor(containerId, cells) {
+    for (const c of cells) {
+      const k = key(c.bay, c.row, c.tier);
+      const occBy = occRef.current[k];
+      if (occBy && occBy !== containerId) return false;
+    }
+    return true;
+  }
+
+  // Support check for Tier 2
+  function hasSupportBelow(sizeTEU, bay, row) {
+    // We check Tier 1 occupancy under the would-be Tier 2 cells
+    if (sizeTEU === 1) {
+      const kBelow = key(bay, row, 1);
+      return !!occRef.current[kBelow];
+    }
+    // 40': need BOTH cells supported at Tier 1
+    if (row >= ROWS) return false;
+    const k1 = key(bay, row, 1);
+    const k2 = key(bay, row + 1, 1);
+    const id1 = occRef.current[k1];
+    const id2 = occRef.current[k2];
+    // requirement: both present; they may be the same (one 40') or different (two 20')
+    return !!(id1 && id2);
+  }
+
+  // Decide tier automatically: prefer Tier 1, else Tier 2 with support
+  function chooseTier(containerId, sizeTEU, bay, row) {
+    // Try Tier 1
+    const cellsTier1 = cellsForSizeAt(sizeTEU, bay, row, 1);
+    if (cellsTier1 && isFreeFor(containerId, cellsTier1)) {
+      return { ok: true, tier: 1, cells: cellsTier1 };
+    }
+    // Try Tier 2
+    const cellsTier2 = cellsForSizeAt(sizeTEU, bay, row, 2);
+    if (!cellsTier2) return { ok: false, reason: "Kein Platz (Rand) für 40’." };
+    if (!isFreeFor(containerId, cellsTier2))
+      return { ok: false, reason: "Ziel auf Ebene 2 ist bereits belegt." };
+    if (!hasSupportBelow(sizeTEU, bay, row)) {
+      return {
+        ok: false,
+        reason:
+          sizeTEU === 1
+            ? "Für 20’ auf Ebene 2 fehlt die Stütze darunter."
+            : "Für 40’ auf Ebene 2 müssen beide Zellen darunter belegt sein (ein 40’ oder zwei 20’).",
+      };
+    }
+    return { ok: true, tier: 2, cells: cellsTier2 };
+  }
+
+  function occupy(containerId, newCells, prevCells = []) {
+    // clear previous cells
+    const occCopy = { ...occRef.current };
+    for (const c of prevCells) {
+      const k = key(c.bay, c.row, c.tier);
+      if (occCopy[k] === containerId) delete occCopy[k];
+    }
+    // set new cells
+    for (const c of newCells) {
+      occCopy[key(c.bay, c.row, c.tier)] = containerId;
+    }
+    occRef.current = occCopy;
+    setOcc(occCopy);
+  }
+
+  // ===== Actions =====
+  function placeAtSlot() {
+    if (busy) return;
+    const target = parseSlot(slot);
+    if (!target) {
+      alert("Bitte Slot im Format A1..C3 eingeben (z. B. A1).");
+      return;
+    }
+    if (!selectedId) {
+      alert("Bitte zuerst einen Container auswählen oder hinzufügen.");
+      return;
+    }
+
+    const entry = containersRef.current.find((c) => c.id === selectedId);
+    if (!entry) {
+      alert("Ausgewählter Container nicht gefunden.");
+      return;
+    }
+
+    // Decide tier & check occupancy/support
+    const decision = chooseTier(entry.id, entry.sizeTEU, target.bay, target.row);
+    if (!decision.ok) {
+      alert(decision.reason || "Platzierung nicht möglich.");
+      return;
+    }
+    const tier = decision.tier;
+    const cells = decision.cells;
+
+    setBusy(true);
+
+    const cont = entry.mesh;
+    const { bridge, hook } = craneRef.current;
+
+    // --- Compute target centers
+    const topY = TRAVEL_Y;
+
+    // Crane X aligns to bay center
+    const topOver = slotCenterAtTier(target.bay, target.row, 1).clone();
+    topOver.y = topY;
+
+    // Container center at chosen tier:
+    // 20’: center of (bay,row,tier)
+    // 40’: midpoint between (bay,row,tier) and (bay,row+1,tier)
+    let dropCenter = slotCenterAtTier(target.bay, target.row, tier).clone();
+    if (entry.sizeTEU === 2) {
+      const nextCenter = slotCenterAtTier(target.bay, target.row + 1, tier).clone();
+      dropCenter = dropCenter.lerp(nextCenter, 0.5);
+    }
+
+    const pickTop = cont.position.clone();
+    pickTop.y = topY;
+
+    const hookRest = dropCenter.clone();
+    hookRest.y = dropCenter.y + CONTAINER_HALF_H + 0.2;
+    hookRest.z = CRANE_Z;
+
+    // Move bridge to correct X first
+    animateTo(bridge, new THREE.Vector3(topOver.x, topY, CRANE_Z), 800);
+
+    // Hook + container choreography
+    animateTo(hook, pickTop, 600, () => {
+      animateTo(cont, pickTop, 600, () => {
+        // Move along Z to above target path
+        const topOverZ = entry.sizeTEU === 1 ? topOver.z : dropCenter.z;
+        animateTo(hook, new THREE.Vector3(topOver.x, topOver.y, CRANE_Z), 400);
+        animateTo(cont, new THREE.Vector3(topOver.x, topOver.y, topOverZ), 900, () => {
+          animateTo(hook, hookRest, 600);
+          animateTo(cont, dropCenter, 600, () => {
+            // Update occupancy & remember our cells (with tiers)
+            occupy(entry.id, cells, entry.cells);
+            entry.cells = cells;
+            setBusy(false);
+          });
+        });
+      });
+    });
+  }
+
   // ===== UI =====
   return (
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: "1fr 320px",
+        gridTemplateColumns: "1fr 380px",
         gap: 16,
         height: "100vh",
         padding: 16,
         boxSizing: "border-box",
       }}
     >
-      {/* 3D-Canvas */}
+      {/* 3D canvas */}
       <div
         ref={mountRef}
         style={{
@@ -343,8 +479,77 @@ export default function App() {
 
       {/* Sidebar */}
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        <h2 style={{ margin: 0 }}>Hafenkran · Mini-Yard (A–C × 1–3)</h2>
+        <h2 style={{ margin: 0 }}>Hafenkran · Mini-Yard (A–C × 1–3) · 2 Ebenen</h2>
 
+        {/* Add container */}
+        <div
+          style={{
+            padding: 12,
+            border: "1px solid #e5e5e5",
+            borderRadius: 10,
+            background: "#fafafa",
+            display: "grid",
+            gridTemplateColumns: "1fr 1fr",
+            gap: 8,
+          }}
+        >
+          <label style={{ fontSize: 13 }}>
+            Größe:
+            <select
+              value={newSize}
+              onChange={(e) => setNewSize(Number(e.target.value))}
+              style={{ marginLeft: 8, padding: "6px 8px" }}
+            >
+              <option value={1}>20’ (1 TEU)</option>
+              <option value={2}>40’ (2 TEU)</option>
+            </select>
+          </label>
+
+          <label style={{ fontSize: 13 }}>
+            Farbe:
+            <input
+              type="color"
+              value={newColor}
+              onChange={(e) => setNewColor(e.target.value)}
+              style={{ marginLeft: 8, padding: 0, width: 44, height: 28, verticalAlign: "middle" }}
+            />
+          </label>
+
+          <button
+            onClick={handleAddContainer}
+            style={{
+              gridColumn: "1 / span 2",
+              padding: "8px 12px",
+              border: "1px solid #ddd",
+              borderRadius: 8,
+              background: "#f7f7f7",
+              cursor: "pointer",
+            }}
+          >
+            Neuen Container hinzufügen
+          </button>
+          <div style={{ gridColumn: "1 / span 2", fontSize: 12, color: "#666" }}>
+            40’ belegt zwei Slots gleicher Buchstabe + nächste Zahl (z. B. A1+A2).
+          </div>
+        </div>
+
+        {/* Select active container */}
+        <label style={{ fontSize: 14 }}>
+          Aktiver Container:{" "}
+          <select
+            value={selectedId || ""}
+            onChange={(e) => setSelectedId(e.target.value)}
+            style={{ marginLeft: 8, padding: "6px 8px", minWidth: 240 }}
+          >
+            {containers.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        {/* Move to slot */}
         <label style={{ fontSize: 14 }}>
           Zielslot (z. B. <b>A1</b>):{" "}
           <input
@@ -357,7 +562,7 @@ export default function App() {
 
         <button
           onClick={placeAtSlot}
-          disabled={busy}
+          disabled={busy || !selectedId}
           style={{
             padding: "8px 12px",
             border: "1px solid #ddd",
@@ -366,13 +571,15 @@ export default function App() {
             cursor: busy ? "not-allowed" : "pointer",
           }}
         >
-          {busy ? "Kran arbeitet…" : "Container zum Slot bewegen"}
+          {busy ? "Kran arbeitet…" : "Aktiven Container zum Slot bewegen"}
         </button>
 
         <div style={{ fontSize: 13, color: "#555", lineHeight: 1.5 }}>
-          • Bays: <b>A–C</b>, Reihen: <b>1–3</b> (insgesamt 3×3 Zellen).<br />
-          • Kamera: Linke Maus – Orbit, Mausrad – Zoom, Rechte Maus – Pan.<br />
-          • Die Box wird sauber auf die Bodenplatte gesetzt (keine „Versenkung“).
+          • **Tier 1** zuerst, **Tier 2** nur wenn Tier 1 belegt ist und Stützregeln passen.<br />
+          • 20’ auf Tier 2: Zelle darunter muss belegt sein.<br />
+          • 40’ auf Tier 2: Beide Zellen darunter müssen belegt sein (ein 40’ oder zwei 20’).<br />
+          • Letzte Reihe (x3) ist Startzelle für 40’ nicht zulässig (braucht +1 Reihe).<br />
+          • Kamera: Linke Maus – Orbit, Mausrad – Zoom, Rechte Maus – Pan.
         </div>
       </div>
     </div>
